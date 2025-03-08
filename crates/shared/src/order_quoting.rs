@@ -7,7 +7,6 @@ use {
     },
     crate::{
         account_balances::{BalanceFetching, Query},
-        db_order_conversions::order_kind_from,
         fee::FeeParameters,
         order_validation::PreOrderData,
         price_estimation::{Estimate, QuoteVerificationMode, Verification},
@@ -191,7 +190,7 @@ impl TryFrom<QuoteRow> for QuoteData {
                 gas_price: row.gas_price,
                 sell_token_price: row.sell_token_price,
             },
-            kind: order_kind_from(row.order_kind),
+            kind: row.order_kind.into(),
             expiration: row.expiration_timestamp,
             quote_kind: row.quote_kind,
             solver: H160(row.solver.0),

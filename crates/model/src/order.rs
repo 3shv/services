@@ -9,13 +9,27 @@ use {
         quote::QuoteId,
         signature::{self, EcdsaSignature, EcdsaSigningScheme, Signature},
     },
-    anyhow::{Result, anyhow},
+    anyhow::{Context, Result, anyhow},
     app_data::{AppDataHash, hash_full_app_data},
     chrono::{DateTime, offset::Utc},
+    database::{
+        onchain_broadcasted_orders::OnchainOrderPlacementError as DbOnchainOrderPlacementError,
+        orders::{
+            BuyTokenDestination as DbBuyTokenDestination,
+            ExecutionTime,
+            FullOrder,
+            OrderClass as DbOrderClass,
+            OrderKind as DbOrderKind,
+            SellTokenSource as DbSellTokenSource,
+        },
+    },
     derive_more::Debug as DeriveDebug,
     hex_literal::hex,
     num::BigUint,
-    number::serialization::HexOrDecimalU256,
+    number::{
+        conversions::{big_decimal_to_big_uint, big_decimal_to_u256},
+        serialization::HexOrDecimalU256,
+    },
     primitive_types::{H160, H256, U256},
     serde::{Deserialize, Deserializer, Serialize, Serializer, de},
     serde_with::{DisplayFromStr, serde_as},
@@ -55,6 +69,25 @@ pub struct Order {
     pub interactions: Interactions,
 }
 
+impl TryFrom<&FullOrder> for Order {
+    type Error = anyhow::Error;
+
+    fn try_from(order: &FullOrder) -> Result<Self, Self::Error> {
+        let signing_scheme = order.signing_scheme.into();
+        let signature = Signature::from_bytes(signing_scheme, &order.signature)?;
+
+        Ok(Self {
+            metadata: order.try_into()?,
+            data: order.try_into()?,
+            signature,
+            interactions: Interactions {
+                pre: InteractionData::extract_interactions_from(&order, ExecutionTime::Pre)?,
+                post: InteractionData::extract_interactions_from(&order, ExecutionTime::Post)?,
+            },
+        })
+    }
+}
+
 #[derive(Eq, PartialEq, Clone, Copy, Debug, Deserialize, Serialize, Hash, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum OrderStatus {
@@ -64,6 +97,33 @@ pub enum OrderStatus {
     Fulfilled,
     Cancelled,
     Expired,
+}
+
+impl From<&FullOrder> for OrderStatus {
+    fn from(order: &FullOrder) -> Self {
+        match order.kind {
+            database::orders::OrderKind::Buy => {
+                if order.is_buy_order_filled() {
+                    return OrderStatus::Fulfilled;
+                }
+            }
+            database::orders::OrderKind::Sell => {
+                if order.is_sell_order_filled() {
+                    return OrderStatus::Fulfilled;
+                }
+            }
+        }
+        if order.invalidated {
+            return OrderStatus::Cancelled;
+        }
+        if order.valid_to() < Utc::now().timestamp() {
+            return OrderStatus::Expired;
+        }
+        if order.presignature_pending {
+            return OrderStatus::PresignaturePending;
+        }
+        OrderStatus::Open
+    }
 }
 
 impl Order {
@@ -274,6 +334,28 @@ impl OrderData {
     pub fn within_market(&self, quote: QuoteAmounts) -> bool {
         (self.sell_amount + self.fee_amount).full_mul(quote.buy)
             >= (quote.sell + quote.fee).full_mul(self.buy_amount)
+    }
+}
+
+impl TryFrom<&FullOrder> for OrderData {
+    type Error = anyhow::Error;
+
+    fn try_from(order: &FullOrder) -> Result<Self, Self::Error> {
+        Ok(Self {
+            sell_token: H160(order.sell_token.0),
+            buy_token: H160(order.buy_token.0),
+            receiver: order.receiver.map(|address| H160(address.0)),
+            sell_amount: big_decimal_to_u256(&order.sell_amount)
+                .context("sell_amount is not U256")?,
+            buy_amount: big_decimal_to_u256(&order.buy_amount).context("buy_amount is not U256")?,
+            valid_to: order.valid_to.try_into().context("valid_to is not u32")?,
+            app_data: AppDataHash(order.app_data.0),
+            fee_amount: big_decimal_to_u256(&order.fee_amount).context("fee_amount is not U256")?,
+            kind: order.kind.into(),
+            partially_fillable: order.partially_fillable,
+            sell_token_balance: order.sell_token_balance.into(),
+            buy_token_balance: order.buy_token_balance.into(),
+        })
     }
 }
 
@@ -643,6 +725,37 @@ pub enum OnchainOrderPlacementError {
     Other,
 }
 
+impl OnchainOrderPlacementError {
+    pub fn onchain_order_placement_error_from(
+        order: &FullOrder,
+    ) -> Option<OnchainOrderPlacementError> {
+        match order.onchain_placement_error {
+            Some(DbOnchainOrderPlacementError::InvalidOrderData) => {
+                Some(OnchainOrderPlacementError::InvalidOrderData)
+            }
+            Some(DbOnchainOrderPlacementError::PreValidationError) => {
+                Some(OnchainOrderPlacementError::PreValidationError)
+            }
+            Some(DbOnchainOrderPlacementError::DisabledOrderClass) => {
+                Some(OnchainOrderPlacementError::DisabledOrderClass)
+            }
+            Some(DbOnchainOrderPlacementError::ValidToTooFarInFuture) => {
+                Some(OnchainOrderPlacementError::ValidToTooFarInTheFuture)
+            }
+            Some(DbOnchainOrderPlacementError::NonZeroFee) => {
+                Some(OnchainOrderPlacementError::NonZeroFee)
+            }
+            Some(DbOnchainOrderPlacementError::Other) => Some(OnchainOrderPlacementError::Other),
+            Some(
+                database::onchain_broadcasted_orders::OnchainOrderPlacementError::QuoteNotFound
+                | database::onchain_broadcasted_orders::OnchainOrderPlacementError::InvalidQuote
+                | database::onchain_broadcasted_orders::OnchainOrderPlacementError::InsufficientFee,
+            )
+            | None => None,
+        }
+    }
+}
+
 // stores all data related to onchain order palcement
 #[serde_as]
 #[derive(Eq, PartialEq, Clone, Default, Deserialize, Serialize, Debug)]
@@ -691,6 +804,66 @@ pub struct OrderMetadata {
     /// Full app data that `OrderData::app_data` is a hash of. Can be None if
     /// the backend doesn't know about the full app data.
     pub full_app_data: Option<String>,
+}
+
+impl TryFrom<&FullOrder> for OrderMetadata {
+    type Error = anyhow::Error;
+
+    fn try_from(order: &FullOrder) -> Result<Self, Self::Error> {
+        let status: OrderStatus = order.into();
+        let class: OrderClass = order.class.into();
+
+        let onchain_order_data = order.onchain_user.map(|onchain_user| {
+            let user = H160(onchain_user.0);
+            let placement_error =
+                OnchainOrderPlacementError::onchain_order_placement_error_from(order);
+            OnchainOrderData {
+                sender: user,
+                placement_error,
+            }
+        });
+
+        let ethflow_data = order
+            .ethflow_data
+            .map(|(refund_tx, user_valid_to)| EthflowData {
+                user_valid_to,
+                refund_tx_hash: refund_tx.map(|hash| H256::from(hash.0)),
+            });
+
+        let app_data = match &order.full_app_data {
+            Some(x) => Some(String::from_utf8(x.to_vec()).context("full app data isn't utf-8")?),
+            None => None,
+        };
+
+        Ok(Self {
+            creation_date: order.creation_timestamp,
+            owner: H160(order.owner.0),
+            uid: OrderUid(order.uid.0),
+            available_balance: Default::default(),
+            executed_buy_amount: big_decimal_to_big_uint(&order.sum_buy)
+                .context("executed buy amount is not an unsigned integer")?,
+            executed_sell_amount: big_decimal_to_big_uint(&order.sum_sell)
+                .context("executed sell amount is not an unsigned integer")?,
+            executed_sell_amount_before_fees: big_decimal_to_u256(
+                &(&order.sum_sell - &order.sum_fee),
+            )
+            .context("executed sell amount before fees does not fit in a u256")?,
+            executed_fee_amount: big_decimal_to_u256(&order.sum_fee)
+                .context("executed fee amount is not a valid u256")?,
+            executed_fee: big_decimal_to_u256(&order.executed_fee)
+                .context("executed fee is not a valid u256")?,
+            executed_fee_token: H160(order.executed_fee_token.0),
+            invalidated: order.invalidated,
+            status,
+            is_liquidity_order: class == OrderClass::Liquidity,
+            class,
+            settlement_contract: H160(order.settlement_contract.0),
+            ethflow_data,
+            onchain_user: order.onchain_user.map(|user| H160(user.0)),
+            onchain_order_data,
+            full_app_data: app_data,
+        })
+    }
 }
 
 // uid as 56 bytes: 32 for orderDigest, 20 for ownerAddress and 4 for validTo
@@ -817,6 +990,24 @@ pub enum OrderKind {
     Sell,
 }
 
+impl From<DbOrderKind> for OrderKind {
+    fn from(kind: DbOrderKind) -> Self {
+        match kind {
+            DbOrderKind::Buy => OrderKind::Buy,
+            DbOrderKind::Sell => OrderKind::Sell,
+        }
+    }
+}
+
+impl From<OrderKind> for DbOrderKind {
+    fn from(kind: OrderKind) -> Self {
+        match kind {
+            OrderKind::Buy => DbOrderKind::Buy,
+            OrderKind::Sell => DbOrderKind::Sell,
+        }
+    }
+}
+
 #[derive(
     Eq,
     PartialEq,
@@ -856,6 +1047,26 @@ pub enum OrderClass {
 impl OrderClass {
     pub fn is_limit(&self) -> bool {
         matches!(self, Self::Limit)
+    }
+}
+
+impl From<DbOrderClass> for OrderClass {
+    fn from(order_class: DbOrderClass) -> Self {
+        match order_class {
+            DbOrderClass::Market => OrderClass::Market,
+            DbOrderClass::Liquidity => OrderClass::Liquidity,
+            DbOrderClass::Limit => OrderClass::Limit,
+        }
+    }
+}
+
+impl From<OrderClass> for DbOrderClass {
+    fn from(order_class: OrderClass) -> Self {
+        match order_class {
+            OrderClass::Market => DbOrderClass::Market,
+            OrderClass::Liquidity => DbOrderClass::Liquidity,
+            OrderClass::Limit => DbOrderClass::Limit,
+        }
     }
 }
 
@@ -927,6 +1138,26 @@ impl SellTokenSource {
     }
 }
 
+impl From<DbSellTokenSource> for SellTokenSource {
+    fn from(source: DbSellTokenSource) -> Self {
+        match source {
+            DbSellTokenSource::Erc20 => SellTokenSource::Erc20,
+            DbSellTokenSource::External => SellTokenSource::External,
+            DbSellTokenSource::Internal => SellTokenSource::Internal,
+        }
+    }
+}
+
+impl From<SellTokenSource> for DbSellTokenSource {
+    fn from(source: SellTokenSource) -> Self {
+        match source {
+            SellTokenSource::Erc20 => DbSellTokenSource::Erc20,
+            SellTokenSource::External => DbSellTokenSource::External,
+            SellTokenSource::Internal => DbSellTokenSource::Internal,
+        }
+    }
+}
+
 /// Destination for which the buyAmount should be transferred to order's
 /// receiver to upon fulfillment
 #[derive(Eq, PartialEq, Clone, Copy, Debug, Default, Deserialize, Serialize, Hash, EnumString)]
@@ -960,6 +1191,24 @@ impl BuyTokenDestination {
         match self {
             Self::Erc20 => Self::ERC20,
             Self::Internal => Self::INTERNAL,
+        }
+    }
+}
+
+impl From<DbBuyTokenDestination> for BuyTokenDestination {
+    fn from(destination: DbBuyTokenDestination) -> Self {
+        match destination {
+            DbBuyTokenDestination::Erc20 => BuyTokenDestination::Erc20,
+            DbBuyTokenDestination::Internal => BuyTokenDestination::Internal,
+        }
+    }
+}
+
+impl From<BuyTokenDestination> for DbBuyTokenDestination {
+    fn from(destination: BuyTokenDestination) -> Self {
+        match destination {
+            BuyTokenDestination::Erc20 => DbBuyTokenDestination::Erc20,
+            BuyTokenDestination::Internal => DbBuyTokenDestination::Internal,
         }
     }
 }
